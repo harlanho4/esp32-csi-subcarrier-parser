@@ -63,9 +63,9 @@ python esp32_subcarriers.py csi_data.csv --with-frequency --primary-center-mhz 2
 
 计算公式：
 
-$
+$$
 f_k = f_{\mathrm{LTF\ center}} + k \times 312{,}500\ \mathrm{Hz}
-$
+$$
 
 LLTF/HT20 使用主 20 MHz 信道中心。HT40 的中心相对于主信道中心在辅信道 `above` 时增加 10 MHz，在 `below` 时减少 10 MHz。
 

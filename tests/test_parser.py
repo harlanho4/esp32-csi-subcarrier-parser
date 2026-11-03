@@ -1,4 +1,4 @@
-"""Contract tests against ESP-IDF v4.2.4's 13-row CSI layout table."""
+"""Regression tests for ESP-IDF v5.5 and legacy v4.2.4 CSI layouts."""
 
 import csv
 import json
@@ -15,6 +15,7 @@ from esp32_subcarriers import (
     parse_record,
     primary_center_frequency_hz,
     process_csv,
+    validate_csv_header,
 )
 
 
@@ -37,7 +38,7 @@ TABLE = [
 
 
 def make_record(secondary, sig_mode, bandwidth, stbc, enabled=frozenset(('lltf', 'htltf', 'stbc')),
-                channel=6, invalid=0):
+                channel=6, invalid=0, antenna=0):
     layout = get_layout(sig_mode, bandwidth, secondary, stbc, set(enabled))
     content_len = 2 * sum(len(k) for _, k in layout)
     padded_len = content_len + (-content_len % 4)
@@ -57,10 +58,20 @@ def make_record(secondary, sig_mode, bandwidth, stbc, enabled=frozenset(('lltf',
     row[16] = str(channel)
     row[17] = str(secondary)
     row[18] = '1234567'
+    row[19] = str(antenna)
     row[22] = str(padded_len)
     row[23] = str(invalid)
     row[24] = json.dumps(raw)
     return row
+
+
+VALID_HEADER = [
+    'type', 'id', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs', 'bandwidth',
+    'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding',
+    'sgi', 'noise_floor', 'ampdu_cnt', 'channel', 'secondary_channel',
+    'local_timestamp', 'ant', 'sig_len', 'rx_format', 'len', 'first_word',
+    'data',
+]
 
 
 class TestSubcarrierParser(unittest.TestCase):
@@ -105,13 +116,49 @@ class TestSubcarrierParser(unittest.TestCase):
         self.assertEqual(primary_center_frequency_hz(14, '2g'), 2484_000_000)
         self.assertEqual(primary_center_frequency_hz(36, '5g'), 5180_000_000)
 
+    def test_v55_header_aliases(self):
+        validate_csv_header(VALID_HEADER)
+        legacy = list(VALID_HEADER)
+        legacy[21] = 'rx_state'
+        legacy[23] = 'first_word_invalid'
+        validate_csv_header(legacy)
+        invalid = list(VALID_HEADER)
+        invalid[7] = 'fft_gain'
+        with self.assertRaisesRegex(ValueError, 'column 7'):
+            validate_csv_header(invalid)
+
+    def test_v55_rejects_15_column_format(self):
+        with self.assertRaisesRegex(RuntimeError, '15-column'):
+            parse_record(['CSI_DATA'] + ['0'] * 14, {'lltf'})
+        with self.assertRaisesRegex(RuntimeError, '15-column'):
+            validate_csv_header(['type'] + ['x'] * 14)
+
+    def test_v55_metadata_and_antenna_grouping(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / 'in.csv'
+            dest = Path(td) / 'out'
+            with source.open('w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(VALID_HEADER)
+                writer.writerow(make_record(0, 1, 0, 0, antenna=0))
+                writer.writerow(make_record(0, 1, 0, 0, antenna=1))
+            process_csv(str(source), str(dest), {'lltf', 'htltf'}, False, '2g', None)
+            files = list(dest.glob('*.npz'))
+            self.assertEqual(len(files), 4)
+            for fn in files:
+                with np.load(fn) as data:
+                    self.assertEqual(data['csi'].shape[0], 1)
+                    self.assertEqual(data['idf_version'].item(), 'v5.5')
+                    self.assertEqual(data['chip'].item(), 'esp32')
+                    self.assertIn(data['antenna'].item(), (0, 1))
+
     def test_records_grouped_by_primary_channel(self):
         with tempfile.TemporaryDirectory() as td:
             source = Path(td) / 'in.csv'
             dest = Path(td) / 'out'
             with source.open('w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['type'] + [str(i) for i in range(24)])
+                writer.writerow(VALID_HEADER)
                 writer.writerow(make_record(0, 1, 0, 0, channel=1))
                 writer.writerow(make_record(0, 1, 0, 0, channel=6))
             process_csv(str(source), str(dest), {'lltf', 'htltf'}, True, '2g', None)

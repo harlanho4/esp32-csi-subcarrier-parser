@@ -107,9 +107,9 @@ For an 802.11n HT20 packet with the secondary channel **below** the primary, the
 
 Activate `--with-frequency` to add a `frequency_hz` vector to each `.npz` file:
 
-\[
-f_k = f_{\mathrm{LTF\ center}} + k \times 312{,}500\ \mathrm{Hz}.
-\]
+$
+f_k = f_{\mathrm{LTF\ center}} + k \times 312{,}500\ \mathrm{Hz}
+$
 
 - **LLTF / HT20:** center is the primary 20 MHz channel center.
 - **HT40:** center is the primary channel center **+10 MHz** when the secondary channel is `above`, or **−10 MHz** when `below`.

@@ -1,9 +1,11 @@
 __pycache__/
 *.py[cod]
-.pytest_cache/
 .venv/
 venv/
+.env
 .DS_Store
+.pytest_cache/
 csi_processed/
+processed/
 *.npz
-*.csv
+csi_data.csv

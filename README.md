@@ -2,7 +2,7 @@
 
 [简体中文](README_zh-CN.md) | English
 
-Parse CSI CSV captures from the **original ESP32** (ESP-IDF **v4.2.4** CSI layout) into complex NumPy arrays with **standardized, ascending physical subcarrier indices**. Optionally reconstruct the absolute RF frequency of each subcarrier.
+Parse CSI CSV captures using the **legacy 25-column ESP32 CSI layout** (ESP-IDF **v5.5**, backward-compatible with **v4.2.4**) into complex NumPy arrays with **standardized, ascending physical subcarrier indices**. Optionally reconstruct the absolute RF frequency of each subcarrier.
 
 The parser focuses exclusively on subcarrier structure. It does **not** calculate amplitude or phase, perform filtering, phase sanitization, calibration, or resampling.
 
@@ -10,14 +10,17 @@ The parser focuses exclusively on subcarrier structure. It does **not** calculat
 
 - Reads the classic ESP32 `CSI_DATA` **25-column** CSV format.
 - Decodes signed I/Q values in Espressif's `[imag, real, imag, real, …]` order into `complex64` samples.
-- Supports all **13 CSI layouts** in the [ESP-IDF v4.2.4 CSI table](https://docs.espressif.com/projects/esp-idf/en/v4.2.4/esp32/api-guides/wifi.html#wi-fi-channel-state-information): non-HT / HT, 20 / 40 MHz, STBC, and secondary-channel placement.
+- Supports all **13 CSI layouts** in the [ESP-IDF v5.5 CSI table](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-guides/wifi.html#wi-fi-channel-state-information): non-HT / HT, 20 / 40 MHz, STBC, and secondary-channel placement.
 - Separates LLTF, HT-LTF and STBC-HT-LTF, with optional LTFs controlled by `--ltfs`.
 - Removes DC and guard subcarriers, retains **pilot subcarriers**, and sorts the physical frequency positions from low to high.
 - Handles `first_word_invalid`, optional LTFs, and 4-byte trailing CSI buffer alignment.
-- Groups outputs by MAC, **primary channel**, PHY configuration, and LTF.
+- Validates the 25-column header (including v5.5 `rx_format` and legacy `rx_state` column names).
+- Groups outputs by MAC, **primary channel, receiver antenna**, PHY configuration, and LTF.
 - Optionally emits **actual RF frequencies in Hz** with `--with-frequency`.
 
-> **Compatibility:** This is for the **original ESP32** with the legacy CSI layout and 25-column CSV, as described in the linked ESP-IDF version. The 15-column ESP32-C5/C6 captures and other chips' CSI formats need a different mapping. The parser explicitly rejects 15-column captures.
+> **ESP-IDF v5.5 compatibility:** The legacy CSI subcarrier table is unchanged from v4.2.4 for the original ESP32. This parser also accepts the same documented legacy table for ESP32-S2, ESP32-S3, and ESP32-C3 when the firmware outputs the matching **25-column CSV**. Set `--chip` to identify the target; it is metadata, not a conversion between chip CSI layouts.
+>
+> **Different CSI formats:** Current ESP32-C5/C6 example captures use a **15-column** CSV with a distinct per-chip CSI layout. C5 also supports additional PHY/LTF formats. Those records are rejected intentionally: `len` and `rx_format` alone are insufficient to reconstruct every needed bandwidth, secondary-channel, STBC, and LTF mapping. Firmware-specific metadata must be available before those formats can be parsed reliably.
 
 ## Installation
 
@@ -36,6 +39,12 @@ python esp32_subcarriers.py csi_data.csv
 # Specify which LTFs were enabled in your ESP32 firmware
 python esp32_subcarriers.py csi_data.csv --ltfs lltf htltf -o processed
 
+# Explicitly select a legacy-layout target and ESP-IDF generation
+python esp32_subcarriers.py csi_data.csv --chip esp32s3 --idf-version v5.5
+
+# Previous generation ESP32 captures use the same subcarrier mapping
+python esp32_subcarriers.py csi_data.csv --chip esp32 --idf-version v4.2.4
+
 # Export absolute frequencies for 2.4 GHz captures (default band)
 python esp32_subcarriers.py csi_data.csv --with-frequency
 
@@ -46,20 +55,20 @@ python esp32_subcarriers.py csi_data.csv --with-frequency --band 5g
 python esp32_subcarriers.py csi_data.csv --with-frequency --primary-center-mhz 2412
 ```
 
-The default output directory is `csi_processed/`. Each `.npz` file corresponds to a fixed `(MAC, primary channel, PHY mode, bandwidth, secondary-channel placement, STBC, LTF)` combination.
+The default output directory is `csi_processed/`. Each `.npz` file corresponds to a fixed `(MAC, primary channel, receiver antenna, PHY mode, bandwidth, secondary-channel placement, STBC, LTF)` combination.
 
 ### Example output
 
 ```text
 csi_processed/
-├── 94d9b3808c81_ch6_sig1_bw20_none_stbc0_lltf.npz
-└── 94d9b3808c81_ch6_sig1_bw20_none_stbc0_htltf.npz
+├── 94d9b3808c81_ch6_ant0_sig1_bw20_none_stbc0_lltf.npz
+└── 94d9b3808c81_ch6_ant0_sig1_bw20_none_stbc0_htltf.npz
 ```
 
 ```python
 import numpy as np
 
-data = np.load("csi_processed/94d9b3808c81_ch6_sig1_bw20_none_stbc0_htltf.npz")
+data = np.load("csi_processed/94d9b3808c81_ch6_ant0_sig1_bw20_none_stbc0_htltf.npz")
 H = data["csi"]                       # complex64, shape (frames, 56)
 k = data["subcarrier_index"]           # [-28, ...,-1, 1,...,28]
 valid = data["valid"]                   # bool mask for invalid samples
@@ -81,6 +90,9 @@ frequency_mhz = data["frequency_hz"] / 1e6
 | `packet_id` | `(T,)` captured packet identifier |
 | `row_number` | `(T,)` original CSV line numbers |
 | `channel` | Primary Wi-Fi channel number |
+| `antenna` | Receiver antenna identifier from the CSI CSV (`ant`) |
+| `chip` | Selected legacy-layout ESP chip (`--chip`) |
+| `idf_version` | Selected ESP-IDF layout version (`--idf-version`) |
 | `bandwidth_mhz` | 20 or 40 |
 | `secondary_channel` | `none`, `above`, or `below` |
 | `ltf` | `lltf`, `htltf`, or `stbc` |
@@ -119,7 +131,7 @@ $$
 
 **Example:** Primary channel 6 has a 2.4 GHz center at 2437 MHz. For HT40 with secondary `above`, the bonded-channel center is 2447 MHz. Subcarrier `k = -57` therefore corresponds to 2429.1875 MHz.
 
-The primary channel number, PHY metadata, and LTF selection must match the firmware configuration. Input CSI may already have been altered by receiver hardware and firmware gain processing; this parser preserves the complex values it receives, apart from marking an invalid first word.
+The primary channel number, antenna identifier, PHY metadata, and LTF selection must match the firmware configuration. 5 GHz frequency mapping flags are retained for explicit/manual mapping, but the classic ESP32/S2/S3/C3 devices covered by this 25-column parser use 2.4 GHz Wi-Fi. Input CSI may already have been altered by receiver hardware and firmware gain processing; this parser preserves the complex values it receives, apart from marking an invalid first word.
 
 ## Testing
 
@@ -127,11 +139,14 @@ The primary channel number, PHY metadata, and LTF selection must match the firmw
 python -m unittest discover -s tests -v
 ```
 
-The tests cover the official 13 layout combinations, expected byte lengths, ascending/normalized indices, 4-byte alignment, and frequency conversions.
+The tests cover the 13 legacy layout combinations (unchanged in ESP-IDF v5.5), expected byte lengths, 25-column header validation, 15-column rejection, receiver-antenna grouping, ascending/normalized indices, 4-byte alignment, and frequency conversions. These are synthetic tests, not measurements on v5.5 hardware.
 
 ## References
 
-- [Espressif ESP-IDF v4.2.4 — Wi-Fi Channel State Information](https://docs.espressif.com/projects/esp-idf/en/v4.2.4/esp32/api-guides/wifi.html#wi-fi-channel-state-information)
+- [Espressif ESP-IDF v5.5 — Wi-Fi Channel State Information](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-guides/wifi.html#wi-fi-channel-state-information)
+- [Espressif ESP-IDF v5.5 ESP32-C5 — CSI variant](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32c5/api-guides/wifi.html#wi-fi-channel-state-information)
+
+- [Espressif ESP-IDF v4.2.4 — previous Wi-Fi Channel State Information](https://docs.espressif.com/projects/esp-idf/en/v4.2.4/esp32/api-guides/wifi.html#wi-fi-channel-state-information)
 - [Espressif esp-csi — get-started tools](https://github.com/espressif/esp-csi/tree/master/examples/get-started/tools)
 
 ## License

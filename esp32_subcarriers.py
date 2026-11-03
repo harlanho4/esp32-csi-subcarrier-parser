@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Parse classic ESP32 CSI (ESP-IDF v4.2.4) CSV into ordered complex subcarriers.
+"""Parse legacy-format ESP32 CSI (ESP-IDF v5.5 / v4.2.4) into complex subcarriers.
 
-Input: 25-column CSI_DATA CSV from classic ESP32 firmware.
+Input: legacy 25-column CSI_DATA CSV for ESP32 / ESP32-S2 / S3 / C3.
 Output: One NPZ per (MAC, primary channel, PHY configuration, LTF).
 
 The returned ``subcarrier_index`` is defined relative to the relevant LTF's
@@ -12,8 +12,10 @@ When --with-frequency is supplied, ``frequency_hz`` contains absolute RF
 frequency for each column of the complex CSI matrix. Frequency calculation
 assumes a 312.5 kHz OFDM subcarrier spacing.
 
-Scope: original ESP32 CSI layout in ESP-IDF v4.2.4. Other ESP chips/CSI
-formats require a separate layout implementation.
+Scope: legacy 25-column CSI as documented for ESP32, ESP32-S2, ESP32-S3,
+and ESP32-C3 in ESP-IDF v5.5. The v4.2.4 ESP32 layout is identical.
+New 15-column C5/C6 records require target-specific PHY/LTF metadata and
+are intentionally rejected to prevent incorrect subcarrier mappings.
 """
 
 from __future__ import annotations
@@ -30,11 +32,13 @@ import numpy as np
 SECONDARY = {0: "none", 1: "above", 2: "below"}
 ALL_LTFS = ("lltf", "htltf", "stbc")
 SUBCARRIER_SPACING_HZ = 312_500
+SUPPORTED_IDF_VERSIONS = ("v5.5", "v4.2.4")
+SUPPORTED_CHIPS = ("esp32", "esp32s2", "esp32s3", "esp32c3")
 
 
 def get_layout(sig_mode: int, bandwidth: int, secondary: int,
                stbc: int, enabled: set[str]) -> list[tuple[str, np.ndarray]]:
-    """Buffer-order subcarrier indices, transcribed from ESP-IDF v4.2.4."""
+    """Buffer-order subcarrier indices from the unchanged v5.5/v4.2.4 table."""
     if sig_mode not in (0, 1):
         raise ValueError(f"Unsupported sig_mode={sig_mode}; expected 0 or 1")
     if bandwidth not in (0, 1):
@@ -131,12 +135,42 @@ def ltf_center_frequency_hz(primary_hz: int, ltf: str, bandwidth: int,
     return primary_hz
 
 
+def validate_csv_header(row: list[str]) -> None:
+    """Guard against accidental changes in the positional serial CSV schema.
+
+    The ESP-IDF v5.5 get-started firmware uses rx_format instead of the
+    older rx_state name at position 21; neither field affects the layout.
+    """
+    if len(row) == 15:
+        raise RuntimeError(
+            "15-column ESP32-C5/C6 CSI records need a separate PHY/LTF mapping. "
+            "The 25-column legacy layout cannot be applied safely."
+        )
+    if len(row) != 25:
+        raise ValueError(f"Expected 25 CSV header fields, got {len(row)}")
+    required = {
+        0: {"type"}, 1: {"id", "seq"}, 2: {"mac"},
+        5: {"sig_mode"}, 7: {"bandwidth", "cwb"}, 11: {"stbc"},
+        16: {"channel"}, 17: {"secondary_channel", "secondary"},
+        18: {"local_timestamp"}, 19: {"ant", "antenna"},
+        22: {"len"}, 23: {"first_word", "first_word_invalid"}, 24: {"data"},
+    }
+    for idx, names in required.items():
+        name = row[idx].strip().lower()
+        if name not in names:
+            raise ValueError(
+                f"Unsupported 25-column CSV header at column {idx}: "
+                f"{row[idx]!r} (expected {sorted(names)})"
+            )
+
+
 def parse_record(row: list[str], enabled: set[str]
                  ) -> tuple[dict, dict[str, dict[str, np.ndarray]]]:
     if len(row) == 15:
         raise RuntimeError(
-            "15-column ESP32-C5/C6 CSI format detected. This parser is for "
-            "classic ESP32 using the ESP-IDF v4.2.4 25-column format."
+            "15-column ESP32-C5/C6 CSI data detected. ESP-IDF v5.5 "
+            "uses a different layout for these chips, and this format "
+            "does not contain enough PHY/LTF metadata for safe decoding."
         )
     if len(row) != 25:
         raise ValueError(f"Expected 25 fields, got {len(row)}")
@@ -151,6 +185,7 @@ def parse_record(row: list[str], enabled: set[str]
         "bandwidth": int(row[7]),
         "stbc": int(row[11]),
         "channel": int(row[16]),
+        "antenna": int(row[19]),
         "secondary": int(row[17]),
         "timestamp": int(row[18]),
         "first_word_invalid": int(row[23]),
@@ -197,16 +232,26 @@ def parse_record(row: list[str], enabled: set[str]
 
 def process_csv(input_file: str, output_dir: str, enabled: set[str],
                 with_frequency: bool, band: str,
-                primary_center_mhz: float | None) -> None:
+                primary_center_mhz: float | None,
+                chip: str = "esp32", idf_version: str = "v5.5") -> None:
+    if chip not in SUPPORTED_CHIPS:
+        raise ValueError(f"Unsupported chip: {chip}")
+    if idf_version not in SUPPORTED_IDF_VERSIONS:
+        raise ValueError(f"Unsupported ESP-IDF version: {idf_version}")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     groups: dict[tuple, list] = defaultdict(list)
     indices_by_group: dict[tuple, np.ndarray] = {}
     accepted = rejected = 0
 
-    with open(input_file, "r", encoding="utf-8", newline="") as fh:
+    with open(input_file, "r", encoding="utf-8-sig", newline="") as fh:
         for line_number, row in enumerate(csv.reader(fh), start=1):
-            if not row or row[0] != "CSI_DATA":
+            if not row:
+                continue
+            if row[0].strip().lower() == "type":
+                validate_csv_header(row)
+                continue
+            if row[0] != "CSI_DATA":
                 continue
             try:
                 meta, blocks = parse_record(row, enabled)
@@ -226,8 +271,9 @@ def process_csv(input_file: str, output_dir: str, enabled: set[str],
             accepted += 1
 
             for ltf, block in blocks.items():
-                key = (meta["mac"], meta["channel"], meta["sig_mode"],
-                       meta["bandwidth"], meta["secondary"], meta["stbc"], ltf)
+                key = (meta["mac"], meta["channel"], meta["antenna"],
+                       meta["sig_mode"], meta["bandwidth"], meta["secondary"],
+                       meta["stbc"], ltf)
                 if key in indices_by_group:
                     if not np.array_equal(indices_by_group[key], block["k"]):
                         raise ValueError(f"Inconsistent subcarrier mapping for {key}")
@@ -236,12 +282,12 @@ def process_csv(input_file: str, output_dir: str, enabled: set[str],
                 groups[key].append((block["csi"], meta, line_number, primary_hz))
 
     for key, records in groups.items():
-        mac, channel, sig, bandwidth, secondary, stbc, ltf = key
+        mac, channel, antenna, sig, bandwidth, secondary, stbc, ltf = key
         meta_list = [r[1] for r in records]
         k = indices_by_group[key]
         matrix = np.stack([r[0] for r in records])
         filename = (
-            f"{mac.replace(':', '').lower()}_ch{channel}_sig{sig}_"
+            f"{mac.replace(':', '').lower()}_ch{channel}_ant{antenna}_sig{sig}_"
             f"bw{40 if bandwidth else 20}_{SECONDARY[secondary]}_"
             f"stbc{stbc}_{ltf}.npz"
         )
@@ -254,6 +300,9 @@ def process_csv(input_file: str, output_dir: str, enabled: set[str],
             "packet_id": np.asarray([m["packet_id"] for m in meta_list], dtype=np.int64),
             "row_number": np.asarray([r[2] for r in records], dtype=np.int64),
             "channel": np.int16(channel),
+            "antenna": np.int16(antenna),
+            "chip": chip,
+            "idf_version": idf_version,
             "bandwidth_mhz": np.int16(40 if bandwidth else 20),
             "secondary_channel": SECONDARY[secondary],
             "ltf": ltf,
@@ -279,7 +328,11 @@ def process_csv(input_file: str, output_dir: str, enabled: set[str],
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", help="Classic ESP32 CSI_DATA CSV input file")
+    parser.add_argument("input", help="ESP-IDF legacy 25-column CSI_DATA CSV")
+    parser.add_argument("--chip", choices=SUPPORTED_CHIPS, default="esp32",
+                        help="Chip with the legacy CSI layout (default: esp32)")
+    parser.add_argument("--idf-version", choices=SUPPORTED_IDF_VERSIONS,
+                        default="v5.5", help="Firmware layout version (default: v5.5)")
     parser.add_argument("-o", "--output", default="csi_processed")
     parser.add_argument("--ltfs", nargs="+", choices=ALL_LTFS,
                         default=list(ALL_LTFS),
@@ -293,7 +346,7 @@ def main() -> None:
                              "use only if every record shares the same center")
     args = parser.parse_args()
     process_csv(args.input, args.output, set(args.ltfs), args.with_frequency,
-                args.band, args.primary_center_mhz)
+                args.band, args.primary_center_mhz, args.chip, args.idf_version)
 
 
 if __name__ == "__main__":
